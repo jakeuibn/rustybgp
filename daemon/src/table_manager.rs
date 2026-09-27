@@ -1081,6 +1081,32 @@ fn nht_register(
     }
 }
 
+/// Decide whether a best-path change should be synced into the kernel FIB.
+///
+/// Returns `false` when the new best path originates from the kernel itself
+/// (connected routes picked up by address monitoring) or from local injection
+/// (gRPC/CLI).  Re-installing such a route turns the kernel's
+/// `dev ethX proto kernel scope link` connected entry into
+/// `via <own address> ... proto bgp`, which
+///
+/// 1. replaces the connected route that makes on-link nexthops resolvable,
+///    so subsequent BGP-learned route installs fail with
+///    "Network unreachable", and
+/// 2. makes NHT treat every nexthop inside that subnet as unreachable:
+///    `Handle::lookup_route` rejects fib-match entries with
+///    `protocol == Bgp`, and the poisoned entry is exactly that.  Peers then
+///    withdraw the routes they announced through us.
+///
+/// The kernel already owns these routes, so skipping the FIB write is a
+/// no-op there; BGP-side redistribution (export to peers) is unaffected.
+/// A prefix whose best path vanished (`new_best() == None`) still syncs so
+/// that a stale BGP-installed route is withdrawn.
+fn fib_sync_required(update: &table::NlriChange) -> bool {
+    !update
+        .new_best()
+        .is_some_and(|p| p.source.is_kernel() || p.source.is_local())
+}
+
 pub(crate) struct TableShard {
     pub(crate) rtable: table::Table,
     peer_event_tx: FnvHashMap<IpAddr, mpsc::UnboundedSender<ToPeerEvent>>,
@@ -1183,6 +1209,7 @@ impl TableShard {
         // kernel_handle is rarely set, so check it first.
         if let Some(handle) = kernel_handle
             && update.best_changed
+            && fib_sync_required(&update)
         {
             let nexthops: Vec<_> = if update.new_best().is_none() {
                 vec![]
@@ -1542,6 +1569,97 @@ mod tests {
             false,
         );
         assert_eq!(paths.len(), 0);
+    }
+
+    // --- kernel FIB sync decision (via-self install loop guard) ---
+
+    /// Build an `NlriChange` whose `current_paths` carry the given sources.
+    fn change_with_sources(prefix: &str, sources: Vec<Arc<table::Source>>) -> table::NlriChange {
+        let nlri: packet::Nlri = prefix.parse().unwrap();
+        let paths: Vec<table::Path> = sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, source)| table::Path {
+                local_path_id: i as u32,
+                source,
+                nexthop: Some(packet::bgp::Nexthop::V4("192.0.2.1".parse().unwrap())),
+                attr: Arc::new(vec![]),
+            })
+            .collect();
+        table::NlriChange {
+            family: Family::IPV4,
+            net: nlri,
+            dest_id: 0,
+            best_changed: true,
+            any_changed: true,
+            replaced_path_id: None,
+            current_paths: Arc::new(paths),
+        }
+    }
+
+    #[test]
+    fn fib_sync_required_true_for_bgp_best() {
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        let update = change_with_sources("192.168.2.0/24", vec![src]);
+        assert!(fib_sync_required(&update));
+    }
+
+    #[test]
+    fn fib_sync_required_true_when_best_gone() {
+        // Prefix emptied: the (possibly stale) BGP-installed route must be
+        // withdrawn from the kernel.
+        let update = change_with_sources("192.168.2.0/24", vec![]);
+        assert!(fib_sync_required(&update));
+    }
+
+    #[test]
+    fn fib_sync_required_false_for_kernel_sourced_best() {
+        // The connected-injection case: best path is kernel-sourced and must
+        // NOT be re-installed (would poison the kernel table via-self). The
+        // peer 10.0.0.2 sits inside the connected 10.0.0.0/24.
+        let update = change_with_sources("10.0.0.0/24", vec![table::Source::kernel()]);
+        assert!(!fib_sync_required(&update));
+    }
+
+    #[test]
+    fn fib_sync_required_false_for_local_sourced_best() {
+        let update = change_with_sources("192.168.2.0/24", vec![table::Source::local()]);
+        assert!(!fib_sync_required(&update));
+    }
+
+    #[test]
+    fn fib_sync_required_true_when_bgp_takes_over_from_kernel() {
+        // Kernel connected path existed, then a BGP path arrives and wins:
+        // install must happen.
+        let bgp_src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        let update = change_with_sources("192.168.2.0/24", vec![bgp_src, table::Source::kernel()]);
+        assert!(fib_sync_required(&update));
+    }
+
+    #[test]
+    fn fib_sync_required_false_when_kernel_is_sole_after_bgp_withdraw() {
+        // BGP path withdrawn, kernel connected path wins again: skip install.
+        let update = change_with_sources("192.168.2.0/24", vec![table::Source::kernel()]);
+        assert!(!fib_sync_required(&update));
+    }
+
+    #[tokio::test]
+    async fn injected_connected_route_stays_in_rib_after_insert() {
+        // End-to-end over insert_route: a kernel-sourced connected route that
+        // becomes best must remain in the Loc-RIB (export to peers still sees
+        // it even though the FIB sync is skipped). The peer 10.0.0.2 sits
+        // inside the connected 10.0.0.0/24, mirroring the via-self scenario.
+        let tables = make_tables();
+        tables.inject_kernel_route(kr_v4(
+            "10.0.0.0",
+            24,
+            "10.0.0.1",
+            0,
+            kernel::Protocol::Kernel,
+        ));
+        let src = make_peer_source("10.0.0.2", "127.0.0.1", 65002);
+        insert_v4_route(&tables, src, "192.168.2.0/24", "10.0.0.2");
+        assert_eq!(loc_rib_len(&tables, 0, Family::IPV4), 2);
     }
 
     // --- NHT (Nexthop Tracking) tests ---
